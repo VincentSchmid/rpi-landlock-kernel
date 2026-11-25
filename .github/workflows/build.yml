@@ -1,0 +1,176 @@
+name: build
+
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild even if a release for the current kernel already exists
+        type: boolean
+        default: false
+  schedule:
+    - cron: "0 5 * * 1"
+
+permissions:
+  contents: read
+
+# Every run targets the newest kernel, so serialising all runs means two runs
+# can never build or publish the same tag at the same time.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      package_version: ${{ steps.resolve.outputs.package_version }}
+      build: ${{ steps.exists.outputs.build }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Resolve current Raspberry Pi OS kernel
+        id: resolve
+        run: |
+          scripts/resolve.sh resolved.json
+          jq . resolved.json
+          {
+            echo "tag=$(jq -r .tag resolved.json)"
+            echo "package_version=$(jq -r .package_version resolved.json)"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Check for existing release
+        id: exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.resolve.outputs.tag }}
+          PACKAGE_VERSION: ${{ steps.resolve.outputs.package_version }}
+          FORCE: ${{ inputs.force || false }}
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            if [ "$FORCE" = true ]; then
+              echo "build=true" >>"$GITHUB_OUTPUT"
+              echo "Release \`$TAG\` exists; rebuilding because \`force\` is set." >>"$GITHUB_STEP_SUMMARY"
+            else
+              echo "build=false" >>"$GITHUB_OUTPUT"
+              echo "Kernel \`$PACKAGE_VERSION\` already built: release \`$TAG\` exists. Nothing to do." >>"$GITHUB_STEP_SUMMARY"
+            fi
+          else
+            echo "build=true" >>"$GITHUB_OUTPUT"
+            echo "Building kernel \`$PACKAGE_VERSION\` as release \`$TAG\`." >>"$GITHUB_STEP_SUMMARY"
+          fi
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: resolved
+          path: resolved.json
+
+  build:
+    needs: resolve
+    if: needs.resolve.outputs.build == 'true'
+    runs-on: ubuntu-24.04-arm
+    # Same distribution and toolchain (gcc-14, binutils, arm-linux-gnueabihf
+    # compat compiler) as the Raspberry Pi OS kernel build; native arm64.
+    container: debian:trixie
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        flavour: ["2712", "v8"]
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            bc bison build-essential ca-certificates cpio curl dpkg-dev dwarves flex \
+            gcc-14 gcc-arm-linux-gnueabihf git jq kmod libelf-dev libssl-dev \
+            openssl python3 rsync xz-utils zstd
+
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v5
+        with:
+          name: resolved
+
+      - name: Build
+        id: build
+        run: |
+          start=$(date +%s)
+          scripts/build.sh "${{ matrix.flavour }}" resolved.json "$RUNNER_TEMP/work"
+          echo "seconds=$(( $(date +%s) - start ))" >>"$GITHUB_OUTPUT"
+
+      - name: Package
+        env:
+          COMMIT: ${{ github.sha }}
+        run: |
+          scripts/package.sh "${{ matrix.flavour }}" resolved.json "$RUNNER_TEMP/work" dist
+          cp "$RUNNER_TEMP/work/config.diff" "dist/config-${{ matrix.flavour }}.diff"
+          {
+            echo "### ${{ matrix.flavour }}: \`$(cat "$RUNNER_TEMP/work/kernel_release")\`"
+            echo "Build time: $(( ${{ steps.build.outputs.seconds }} / 60 )) min"
+            echo '```'
+            cat "$RUNNER_TEMP/work/config.diff"
+            echo '```'
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: kernel-${{ matrix.flavour }}
+          path: dist/
+          compression-level: 0
+          if-no-files-found: error
+
+  release:
+    needs: [resolve, build]
+    if: needs.resolve.outputs.build == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    concurrency:
+      group: release-${{ needs.resolve.outputs.tag }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v5
+        with:
+          path: artifacts
+
+      - name: Collect assets
+        run: |
+          mkdir dist
+          mv artifacts/resolved/resolved.json .
+          mv artifacts/kernel-*/* dist/
+          cd dist
+          sha256sum landlock-kernel-2712.tar.gz landlock-kernel-v8.tar.gz >SHA256SUMS
+          cat SHA256SUMS
+          for f in 2712 v8; do
+            tar -xzOf "landlock-kernel-$f.tar.gz" metadata.json | jq .
+          done
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          PACKAGE_VERSION: ${{ needs.resolve.outputs.package_version }}
+        run: |
+          scripts/release-notes.sh resolved.json dist >notes.md
+          assets=(dist/landlock-kernel-2712.tar.gz dist/landlock-kernel-v8.tar.gz dist/SHA256SUMS)
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${assets[@]}" --clobber
+            gh release edit "$TAG" --notes-file notes.md --latest
+          else
+            gh release create "$TAG" "${assets[@]}" \
+              --target "$GITHUB_SHA" \
+              --title "Raspberry Pi OS kernel $PACKAGE_VERSION + Landlock" \
+              --notes-file notes.md \
+              --latest
+          fi
+          {
+            echo "Published release \`$TAG\`."
+            echo '```'
+            cat dist/SHA256SUMS
+            echo '```'
+          } >>"$GITHUB_STEP_SUMMARY"
